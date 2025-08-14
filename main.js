@@ -1,0 +1,667 @@
+// --- tiny reactive store ---------------------------------------------------
+  // Populate Tax Year dropdown: latest first (currentYear-1 down to 1995)
+  function populateTaxYearDropdown(){
+    const sel = document.getElementById('taxYear');
+    if(!sel) return;
+    sel.innerHTML = '';
+    const currentYear = new Date().getFullYear();
+    const start = currentYear - 1; // last year
+    for(let y = start; y >= 1995; y--){
+      const opt = document.createElement('option');
+      opt.value = String(y);
+      opt.textContent = String(y);
+      sel.appendChild(opt);
+    }
+    // preselect last year
+    sel.value = String(start);
+    // initialize state without marking as user-entered
+    state.set('taxYear', String(start));
+  }
+
+  // Compute Assessment Level (%) from class code
+  function market_value_multiplier(class_code){
+    const prefix_lookup = {2:10, 5:4, 1:10, 0:0, 4:5};
+    const suffix_lookup = { 'A': 6.6666, 'B': 5 };
+    let prefix = null;
+    try { prefix = parseInt(String(class_code).slice(0,3), 10); } catch(e){ prefix = null; }
+    if(Number.isFinite(prefix) && prefix_lookup.hasOwnProperty(prefix)) return prefix_lookup[prefix];
+    const suffix = String(class_code).slice(-1).toUpperCase();
+    return (suffix_lookup[suffix] ?? 10);
+  }
+
+  // Equalization factor lookup table starting at 1973
+  // Equalization factor lookup table starting at 1973
+  const EQ_BY_YEAR_FROM_1973 = [
+    1.4813,1.4453,1.4483,1.4153,1.4153,1.4966,1.6016,1.7432,1.8548,1.9288,1.9122,1.8445,1.8885,1.8486,1.8916,1.9266,1.9133,1.9946,2.0523,2.0897,2.1407,2.1135,2.1243,2.1517,2.1489,2.1799,2.2505,2.2235,2.3098,2.4689,2.4598,2.5757,2.732,2.7076,2.8439,2.9786,3.3701,3.3,2.9706,2.8056,2.6621,2.7253,2.6685,2.8032,2.9627,2.9109,2.916,3.2234,3.0027,2.9237,3.0163,3.0355,3.0000,3.0000
+  ];
+  function lookupEqFromYear(year){
+    const idx = Number(year) - 1973;
+    if(!Number.isFinite(idx) || idx<0 || idx>=EQ_BY_YEAR_FROM_1973.length) return null;
+    return EQ_BY_YEAR_FROM_1973[idx];
+  }
+  const $ = (id)=>document.getElementById(id);
+  const state = new Map();
+  const given = new Set(); // locked by user
+  const status = new Map(); // 'blank' | 'locked' | 'derived' per field // fields the user typed in
+  const msgs = { mv:'mvMsg', av:'avMsg', aav:'aavMsg', aeav:'aeavMsg', tax:'taxMsg' };
+
+  // Exemptions state: array of { id, code, label, savingsC, aeavC, givenSavings, givenAeav }
+  let exemptions = [];
+  let exIdSeq = 1;
+
+  function setState(key, val, isUser=false){
+    const el = document.getElementById(key);
+    if(isUser){
+      given.add(key); status.set(key,'locked'); markGivenLabel(key, true);
+      if(el) el.classList.remove('is-derived');
+    }
+    if(val === '' || val==null){ state.delete(key); if(isUser){ status.set(key,'blank'); given.delete(key);} }
+    else { state.set(key, val); }
+    if(key==='taxYear') maybeAutoFillEq();
+    recompute();
+  }
+  function markGivenLabel(key, on){
+    const lbl = document.querySelector(`label[for="${key}"]`);
+    if(lbl) lbl.classList.toggle('given', on);
+  }
+
+  // --- Money helpers: integer cents with HALF_UP rounding --------------------
+  const toCents = v => (v===undefined || v===null || v==='') ? null : Math.round(Number(v) * 100);
+  const fromCents = v => v==null? '—' : (v/100).toLocaleString(undefined,{style:'currency', currency:'USD'});
+  function mulDivRound(a, num, den){ // HALF_UP on division
+    const sign = Math.sign(a*num);
+    return Math.floor((a * num + sign * Math.floor(den/2)) / den);
+  }
+  function mulByPercentCents(amountCents, percent){
+    if(amountCents==null || percent==null) return null;
+    const p = Math.round(Number(percent||0) * 1000); // thousandths of a percent
+    return mulDivRound(amountCents, p, 100000);
+  }
+  function divByPercentCents(resultCents, percent){
+    if(resultCents==null || percent==null) return null;
+    const p = Math.round(Number(percent||0) * 1000);
+    if(p<=0) return null;
+    return mulDivRound(resultCents, 100000, p);
+  }
+  function mulByFactorCents(amountCents, factor){
+    if(amountCents==null || factor==null) return null;
+    const f = Math.round(Number(factor||0) * 1000000); // 6-dec fixed
+    return mulDivRound(amountCents, f, 1000000);
+  }
+  function divByFactorCents(resultCents, factor){
+    if(resultCents==null || factor==null) return null;
+    const f = Math.round(Number(factor||0) * 1000000);
+    if(f<=0) return null;
+    return mulDivRound(resultCents, 1000000, f);
+  }
+  const max0 = x => x==null? null : (x<0?0:x);
+
+  // --- Exemptions UI ---------------------------------------------------------
+  function renderExemptions(){
+    const tb = $('exRows');
+    const opts = [
+      {c:'H', n:'Homeowner'},
+      {c:'S', n:'Senior'},
+      {c:'F', n:'Senior Freeze'},
+      {c:'R', n:'Returning Veteran'},
+      {c:'P', n:'Disabled Person'},
+      {c:'V', n:'Disabled Veteran'},
+      {c:'L', n:'Longtime Homeowner'},
+      {c:'I', n:'Homeowner Improvement'}
+    ];
+    tb.innerHTML = exemptions.map((r)=>{
+      const optionsHtml = opts.map(o=>`<option value="${o.c}" ${r.code===o.c? 'selected':''}>${o.c} — ${o.n}</option>`).join('');
+      return `<tr data-id="${r.id}">
+        <td>
+          <select class="tinput" data-f="code">${optionsHtml}</select>
+        </td>
+        <td><input class="tinput ${r.badSavings? 'bad':''}" data-f="savings" inputmode="decimal" type="number" step="0.01" min="0" value="${r.savingsC!=null? (r.savingsC/100).toFixed(2):''}" placeholder="$"/></td>
+        <td><input class="tinput ${r.badAeav? 'bad':''}" data-f="aeav" inputmode="decimal" type="number" step="0.01" min="0" value="${r.aeavC!=null? (r.aeavC/100).toFixed(2):''}" placeholder="AEAV"/></td>
+        <td class="row-actions"><button data-f="del">✕</button></td>
+      </tr>`
+    }).join('');
+    updateExemptionTotals();
+  }
+
+  function addExemption(label='', code='H'){
+    const nameMap = {H:'Homeowner',S:'Senior',F:'Senior Freeze',R:'Returning Veteran',P:'Disabled Person',V:'Disabled Veteran',L:'Longtime Homeowner',I:'Homeowner Improvement'};
+    exemptions.push({ id: exIdSeq++, code, label: (label||nameMap[code]||''), savingsC:null, aeavC:null, givenSavings:false, givenAeav:false, badSavings:false, badAeav:false });
+    renderExemptions();
+  }
+  function clearExemptions(){ exemptions = []; renderExemptions(); recompute(); }
+
+  $('addEx').addEventListener('click', ()=>{ addExemption('', 'H'); });
+  $('clearEx').addEventListener('click', ()=>{ clearExemptions(); });
+  $('runTests').addEventListener('click', runSelfTests);
+  // Auto-fill toggle for Equalization
+  document.addEventListener('change', (e)=>{ if(e.target && e.target.id==='autoEq'){ maybeAutoFillEq(); }});
+  // Assessment Class → Level %
+  document.addEventListener('change', (e)=>{
+    if(e.target && e.target.id==='classCode'){
+      const cls = e.target.value;
+      const lvl = market_value_multiplier(cls);
+      const el = document.getElementById('assess');
+      if(el) el.value = lvl.toFixed(4).replace(/\.0000$/,'');
+      setState('assess', String(lvl), true);
+    }
+  });
+
+  $('exRows').addEventListener('input', (e)=>{
+    const tr = e.target.closest('tr'); if(!tr) return;
+    const id = Number(tr.dataset.id); const row = exemptions.find(x=>x.id===id); if(!row) return;
+    const f = e.target.dataset.f;
+    if(f==='code'){
+      row.code = e.target.value;
+      const nameMap = {H:'Homeowner',S:'Senior',F:'Senior Freeze',R:'Returning Veteran',P:'Disabled Person',V:'Disabled Veteran',L:'Longtime Homeowner',I:'Homeowner Improvement'};
+      row.label = nameMap[row.code] || '';
+      return;
+    }
+    if(f==='savings'){
+      row.savingsC = e.target.value===''? null : toCents(e.target.value);
+      row.givenSavings = true; row.badSavings=false; // mark as user-given
+    }
+    if(f==='aeav'){
+      row.aeavC = e.target.value===''? null : toCents(e.target.value);
+      row.givenAeav = true; row.badAeav=false;
+    }
+    computeAndSyncRow(row, tr);
+    recompute();
+  });
+
+  $('exRows').addEventListener('click', (e)=>{
+    const btn = e.target.closest('button'); if(!btn) return;
+    const tr = e.target.closest('tr'); const id = Number(tr.dataset.id);
+    exemptions = exemptions.filter(x=>x.id!==id);
+    renderExemptions();
+    recompute();
+  });
+
+  function updateExemptionTotals(){
+    const billC = exemptions.reduce((s,r)=> s + (r.savingsC||0), 0);
+    const aeavC = exemptions.reduce((s,r)=> s + (r.aeavC||0), 0);
+    const countF = exemptions.filter(r=>r.code==='F').length;
+    $('exTotals').textContent = `${fromCents(billC)} (bill), ${(aeavC/100).toLocaleString()} AEAV; ${countF? '• Senior Freeze present':''} → AAV via Eq`;
+  }
+
+  // Sync derived input values without re-rendering rows (prevents cursor jumps)
+  function computeAndSyncRow(row, tr){
+    const ratePct = state.has('rate') ? Number(state.get('rate')) : null;
+    const validRate = ratePct!=null && ratePct>0;
+    const sInp = tr.querySelector('input[data-f="savings"]');
+    const aInp = tr.querySelector('input[data-f="aeav"]');
+    row.badSavings = row.badAeav = false;
+    if(row.givenSavings && !row.givenAeav){
+      row.aeavC = validRate ? divByPercentCents(row.savingsC, ratePct) : null;
+      if(aInp && document.activeElement !== aInp){ aInp.value = row.aeavC==null? '' : (row.aeavC/100).toFixed(2); }
+    } else if(row.givenAeav && !row.givenSavings){
+      row.savingsC = validRate ? mulByPercentCents(row.aeavC, ratePct) : null;
+      if(sInp && document.activeElement !== sInp){ sInp.value = row.savingsC==null? '' : (row.savingsC/100).toFixed(2); }
+    }
+    if(row.givenSavings && row.givenAeav && validRate){
+      const expect = mulByPercentCents(row.aeavC, ratePct);
+      if(!close(expect, row.savingsC)){
+        row.badSavings = row.badAeav = true;
+      }
+    }
+    if(sInp) sInp.classList.toggle('bad', !!row.badSavings);
+    if(aInp) aInp.classList.toggle('bad', !!row.badAeav);
+  }
+  function syncExemptionRowInputs(){
+    const tb = $('exRows');
+    exemptions.forEach(row=>{
+      const tr = tb.querySelector(`tr[data-id="${row.id}"]`);
+      if(tr) computeAndSyncRow(row, tr);
+    });
+  }
+
+  function maybeAutoFillEq(){
+    const auto = document.getElementById('autoEq');
+    if(!auto || !auto.checked) return;
+    if(given.has('eq')) return; // user locked eq
+    const yr = document.getElementById('taxYear').value;
+    const val = lookupEqFromYear(yr);
+    if(val!=null){
+      const el = document.getElementById('eq');
+      if(document.activeElement !== el){ el.value = val.toFixed(4); }
+      state.set('eq', val.toFixed(4));
+    }
+  }
+
+  // --- Solver ---------------------------------------------------------------
+  function solve(){
+    const taxYear = Number(state.get('taxYear'))||2025;
+    const assessPct = state.has('assess') ? Number(state.get('assess')) : 10;
+    const eq = state.has('eq') ? Number(state.get('eq')) : 3.0;
+    const ratePct = state.has('rate') ? Number(state.get('rate')) : null;
+
+    let mvC = toCents(state.get('mv'));
+    let avC = toCents(state.get('av'));
+    let aavC = toCents(state.get('aav'));
+    let aeavC = toCents(state.get('aeav'));
+    let taxC = toCents(state.get('tax'));
+
+    // clear validity
+    for(const id of ['mv','av','aav','aeav','tax','assess','eq','rate']) setValid(id, true, '');
+
+    // Per-row backfills & validation
+    let exBillTotalC = 0;
+    let exAeavTotalC = 0;
+    exemptions.forEach(r=>{
+      r.badSavings = false; r.badAeav=false;
+      const validRate = ratePct!=null && ratePct>0;
+
+      // If the user only provided one side, always derive the other from the current rate
+      if(r.givenSavings && !r.givenAeav){
+        r.aeavC = validRate ? divByPercentCents(r.savingsC, ratePct) : null;
+      } else if(r.givenAeav && !r.givenSavings){
+        r.savingsC = validRate ? mulByPercentCents(r.aeavC, ratePct) : null;
+      }
+
+      // If both are user-provided and we have a rate, validate consistency
+      if(r.givenSavings && r.givenAeav && validRate){
+        const expect = mulByPercentCents(r.aeavC, ratePct);
+        if(!close(expect, r.savingsC)){
+          r.badSavings = true; r.badAeav = true;
+        }
+      }
+
+      exBillTotalC += (r.savingsC||0);
+      exAeavTotalC += (r.aeavC||0);
+    });
+    syncExemptionRowInputs(); // update only derived inputs without full re-render
+
+    // 1) If TAX given and RATE present -> derive AEAV (taxable)
+    if(given.has('tax') && ratePct!=null){
+      const aeavFromTax = divByPercentCents(taxC, ratePct);
+      if(aeavFromTax==null){ setValid('tax', false, 'Need rate > 0'); }
+      else{
+        if(given.has('aeav') && !close(aeavC, aeavFromTax)){
+          setValid('tax', false, '≠ AEAV from rate'); setValid('aeav', false, '≠ from tax');
+        }
+        aeavC = aeavC ?? aeavFromTax;
+      }
+    }
+
+    // 2) AEAV & Eq → AAV, then AV = AAV + AAV_exemptions (derived from ex list)
+    // Convert exemption AEAV total to AAV total via Eq
+    const exAavTotalC = divByFactorCents(exAeavTotalC, eq);
+
+    if((given.has('aeav') || aeavC!=null) && eq!=null){
+      const aavFromAeav = divByFactorCents(aeavC, eq);
+      if(aavFromAeav==null){ setValid('aeav', false, 'Need eq > 0'); }
+      else{
+        if(given.has('aav') && !close(aavC, aavFromAeav)){
+          setValid('aav', false, '≠ from AEAV'); setValid('aeav', false, '≠ AAV with eq');
+        }
+        aavC = aavC ?? aavFromAeav;
+      }
+    }
+
+    // If AAV known, compute AV by adding exemption AAV totals
+    if((given.has('aav') || aavC!=null)){
+      const avFromAav = (aavC ?? 0) + (exAavTotalC ?? 0);
+      if(given.has('av') && !close(avC, avFromAav)){
+        setValid('av', false, '≠ from AAV + exemptions'); setValid('aav', false, '≠ with AV − exemptions');
+      }
+      avC = avC ?? avFromAav;
+      if(aavC < 0){ setValid('aav', false, 'AAV < 0 impossible'); }
+      if(avFromAav < (exAavTotalC ?? 0)) setValid('aav', false, 'AAV < exemptions');
+    }
+
+    // 3) AV & Assess → MV
+    if((given.has('av') || avC!=null) && assessPct!=null){
+      const mvFromAv = divByPercentCents(avC, assessPct);
+      if(mvFromAv==null){ setValid('av', false, 'Need assessment > 0'); }
+      else{
+        if(given.has('mv') && !close(mvC, mvFromAv)){
+          setValid('mv', false, '≠ from AV'); setValid('av', false, '≠ from MV');
+        }
+        mvC = mvC ?? mvFromAv;
+      }
+    }
+
+    // 4) Forward compute chain using exemption totals
+    const AVf = mulByPercentCents(mvC ?? 0, assessPct ?? 0);
+    const AAVf = max0((AVf ?? 0) - (exAavTotalC ?? 0));
+    const AEAVf = mulByFactorCents(AAVf ?? 0, eq ?? 0);
+    const Taxf = mulByPercentCents(AEAVf ?? 0, ratePct ?? 0);
+
+    return {
+      taxYear,
+      inputs:{ assessPct, eq, ratePct, mvC, avC, aavC, aeavC, taxC, exBillTotalC, exAeavTotalC, exAavTotalC },
+      derived:{ AVf, AAVf, AEAVf, Taxf }
+    };
+  }
+
+  function close(a,b,eps=2){ if(a==null || b==null) return false; return Math.abs(a-b) <= eps; }
+
+  function setValid(id, ok, msg){
+    const el = $(id); if(!el) return;
+    el.classList.toggle('bad', !ok);
+    const map = { mv:'mvMsg', av:'avMsg', aav:'aavMsg', aeav:'aeavMsg', tax:'taxMsg' };
+    const m = document.getElementById(map[id]||''); if(m) m.innerHTML = !ok ? `<span class="bang">! </span>${msg}` : '';
+  }
+
+  // helpers to surface derived values into inputs without locking
+  function setDerivedInputMoney(key, cents){
+    const el = document.getElementById(key);
+    if(!el) return;
+    if(status.get(key)==='locked') return; // don't overwrite user input
+    if(cents==null){ if(status.get(key)==='derived'){ el.value=''; el.classList.remove('is-derived'); status.set(key,'blank'); }
+      return; }
+    const val = (cents/100).toFixed(2);
+    if(document.activeElement !== el){ el.value = val; }
+    el.classList.add('is-derived');
+    status.set(key,'derived');
+  }
+  function setDerivedInputRatePct(key, pct){
+    const el = document.getElementById(key); if(!el) return;
+    if(status.get(key)==='locked') return;
+    if(pct==null){ if(status.get(key)==='derived'){ el.value=''; el.classList.remove('is-derived'); status.set(key,'blank'); } return; }
+    const val = Number(pct).toFixed(3);
+    if(document.activeElement !== el){ el.value = val; }
+    el.classList.add('is-derived');
+    status.set(key,'derived');
+  }
+
+  // --- recompute & render ----------------------------------------------------
+  function recompute(){
+    const s = solve();
+    const {inputs, derived} = s;
+
+    const MV = inputs.mvC ?? divByPercentCents(inputs.avC ?? derived.AVf, inputs.assessPct);
+    const AV = inputs.avC ?? derived.AVf;
+    const AAV = inputs.aavC ?? derived.AAVf;
+    const AEAV = inputs.aeavC ?? derived.AEAVf;
+    const TAX = inputs.taxC ?? derived.Taxf;
+
+    $('outMV').textContent = fromCents(MV);
+    $('outAV').textContent = fromCents(AV);
+    $('outAAV').textContent = fromCents(AAV);
+    $('outAEAV').textContent = fromCents(AEAV);
+    $('outTax').textContent = fromCents(TAX);
+
+    // Surface derived values into the input form (without locking)
+    setDerivedInputMoney('mv', MV);
+    setDerivedInputMoney('av', AV);
+    setDerivedInputMoney('aav', AAV);
+    setDerivedInputMoney('aeav', AEAV);
+    setDerivedInputMoney('tax', TAX);
+
+    // Auto-solve Rate when possible: need Tax and AEAV independent of Rate
+    if(!given.has('rate') && inputs.taxC!=null){
+      const exNeedsRate = exemptions.some(r => (r.savingsC!=null && (r.aeavC==null || !r.givenAeav)));
+      const AEAVbase = inputs.aeavC ?? derived.AEAVf; // taxable AEAV
+      if(!exNeedsRate && AEAVbase!=null && AEAVbase>0){
+        const ratePctSolved = (inputs.taxC / AEAVbase) * 100; // percent
+        setDerivedInputRatePct('rate', ratePctSolved);
+      }
+    }
+
+    // Update totals footer
+    $('exTotals').textContent = `${fromCents(inputs.exBillTotalC)} (bill), ${(inputs.exAeavTotalC/100).toLocaleString()} AEAV; → ${(inputs.exAavTotalC/100).toLocaleString()} AAV via Eq`;
+
+    const trace = {
+      meta: { rulesVersion: $('version').textContent, rounding: 'HALF_UP to cents' },
+      inputs: {
+        TaxYear: s.taxYear,
+        MarketValue: MV==null? null : MV/100,
+        AssessmentLevelPct: inputs.assessPct,
+        EqualizationFactor: inputs.eq,
+        CompositeRatePct: inputs.ratePct,
+        AV_user: inputs.avC==null? null : inputs.avC/100,
+        AAV_user: inputs.aavC==null? null : inputs.aavC/100,
+        AEAV_user: inputs.aeavC==null? null : inputs.aeavC/100,
+        Tax_user: inputs.taxC==null? null : inputs.taxC/100,
+        Exemptions: exemptions.map(r=>({code:r.code, label:r.label, bill:(r.savingsC==null? null : r.savingsC/100), aeav:(r.aeavC==null? null : r.aeavC/100)}))
+      },
+      steps: [
+        { id:'Exemptions', formula:'Sum bill & AEAV; AAV_ex = AEAV_ex / Eq', value_cents: inputs.exAavTotalC },
+        { id:'AV',   formula:'AV = MV × Assessment% (HALF_UP)',            value_cents: derived.AVf },
+        { id:'AAV',  formula:'AAV = max(AV − AAV_ex, 0)',                   value_cents: derived.AAVf },
+        { id:'AEAV', formula:'AEAV = AAV × EqualizationFactor (HALF_UP)',  value_cents: derived.AEAVf },
+        { id:'Tax',  formula:'Tax = AEAV × CompositeRate% (HALF_UP)',      value_cents: derived.Taxf },
+        { id:'FreezeBaseAEAV', formula:'Base = AEAV_taxable + FixedExemptions_AEAV (exclude Freeze)', value_cents: null }
+      ]
+    };
+
+    // Compute Freeze Base (AEAV) — only if an 'F' exemption exists
+    const hasFreeze = exemptions.some(r=>r.code==='F');
+    let freezeBaseC = null;
+    if(hasFreeze){
+      const freezeAeavTotalC = exemptions.filter(r=>r.code==='F').reduce((s,r)=> s + (r.aeavC||0), 0);
+      const fixedAeavTotalC = inputs.exAeavTotalC - freezeAeavTotalC;
+      const AEAV_taxableC = (inputs.aeavC!=null? inputs.aeavC : derived.AEAVf);
+      freezeBaseC = (AEAV_taxableC==null? null : (AEAV_taxableC + fixedAeavTotalC));
+      $('outFreezeBase').textContent = fromCents(freezeBaseC);
+      // Keep the step and set its value
+      trace.steps = trace.steps.map(st => st.id==='FreezeBaseAEAV' ? {...st, value_cents: freezeBaseC||0} : st);
+    } else {
+      $('outFreezeBase').textContent = '—';
+      // Remove the step if no Freeze exemption exists
+      trace.steps = trace.steps.filter(st => st.id !== 'FreezeBaseAEAV');
+    }
+
+    $('trace').textContent = JSON.stringify({
+      ...trace,
+      steps: trace.steps.map(s=>({id:s.id, formula:s.formula, value: (s.value_cents/100)}))
+    }, null, 2);
+  }
+
+  // wire inputs
+  [['taxYear',''],['assess',''],['eq',''],['rate',''],['mv',''],['av',''],['aav',''],['aeav',''],['tax','']]
+    .forEach(([id,_])=> $(id).addEventListener('input', e=> { setState(id, e.target.value, true); }));
+  // clear derived style on focus (user intent to lock)
+  ['rate','mv','av','aav','aeav','tax'].forEach(id=>{
+    const el = document.getElementById(id); if(!el) return;
+    el.addEventListener('focus', ()=>{
+      el.classList.remove('is-derived');
+      status.set(id, status.get(id)==='derived' ? 'blank' : (status.get(id)||'blank'));
+    });
+  });
+
+  // keep derived exemption cells in sync when rate changes
+  document.getElementById('rate').addEventListener('input', ()=>{ syncExemptionRowInputs(); });
+
+  // placeholders only: assess=10, eq=3.0 (defaults applied internally if blank)
+  populateTaxYearDropdown();
+  // initialize assessment from default class selection
+  (function initAssessFromClass(){
+    const clsSel = document.getElementById('classCode');
+    const lvl = market_value_multiplier(clsSel.value);
+    document.getElementById('assess').value = String(lvl);
+    state.set('assess', String(lvl));
+  })();
+  setState('eq','',false); maybeAutoFillEq();
+  // ensure dropdown change updates state
+  document.getElementById('taxYear').addEventListener('change', e=> setState('taxYear', e.target.value, true));
+  addExemption('Homeowner','H'); addExemption('Senior','S'); addExemption('Senior Freeze','F');
+
+  // buttons
+  $('reset').addEventListener('click', ()=>{
+    given.clear(); status.clear(); exemptions = []; exIdSeq = 1; renderExemptions();
+    ['mv','av','aav','aeav','tax','rate','taxYear','assess','eq'].forEach(k=>{
+      const el=$(k); el.value=''; el.classList.remove('bad','is-derived');
+      const lbl=document.querySelector(`label[for="${k}"]`); if(lbl) lbl.classList.remove('given');
+      const hint=document.getElementById(k+'Msg'); if(hint) hint.textContent='';
+    });
+    populateTaxYearDropdown();
+    // re-init assess and eq
+    (function initAssessFromClass(){
+      const clsSel = document.getElementById('classCode');
+      const lvl = market_value_multiplier(clsSel.value);
+      document.getElementById('assess').value = String(lvl);
+      state.set('assess', String(lvl));
+    })();
+    setState('eq','',false); maybeAutoFillEq();
+    recompute();
+  });
+
+  $('exportJson').addEventListener('click', ()=>{
+    const blob = new Blob([$('trace').textContent], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'tax-trace.json'; a.click();
+    setTimeout(()=> URL.revokeObjectURL(url), 1500);
+  });
+
+  // --- Self Tests ------------------------------------------------------------
+  function runSelfTests(){
+    const out = $('testOut');
+    const snap = snapshotUI();
+    const logs = [];
+    function log(s){ logs.push(s); }
+    function near(a,b,eps=1){ return Math.abs(a-b) <= eps; }
+
+    try{
+      // Test 1: 2010 case from our discussion
+      // Rate 7.188%, Tax $3,097.09, Exemptions (bill): H=431.28, S=287.52, F=3,286.71
+      // Expected: AEAV ≈ 43,087; Freeze Base AEAV ≈ 53,087
+      $('rate').value = '7.188'; setState('rate','7.188',true);
+      $('eq').value = '1.4389'; setState('eq','1.4389',true);
+      $('tax').value = '3097.09'; setState('tax','3097.09',true);
+      exemptions = [];
+      addExemption('Homeowner','H');
+      addExemption('Senior','S');
+      addExemption('Senior Freeze','F');
+      // set bill reductions
+      const tb = $('exRows');
+      const rows = Array.from(tb.querySelectorAll('tr'));
+      const bills = [431.28, 287.52, 3286.71];
+      rows.forEach((tr,i)=>{
+        const inp = tr.querySelector('input[data-f="savings"]');
+        inp.value = bills[i].toFixed(2);
+        // simulate input
+        inp.dispatchEvent(new Event('input', {bubbles:true}));
+      });
+      recompute();
+
+      const aeavTxt = $('outAEAV').textContent.replace(/[^0-9.]/g,'');
+      const aeav = Number(aeavTxt);
+      const freezeTxt = $('outFreezeBase').textContent.replace(/[^0-9.]/g,'');
+      const freezeBase = Number(freezeTxt);
+
+      log(`Test1 AEAV=${aeav} (expect ~43087)`);
+      log(`Test1 FreezeBase=${freezeBase} (expect ~53087)`);
+      if(!near(aeav,43087,1)) throw new Error('AEAV not within $1 of 43087');
+      if(!near(freezeBase,53087,1)) throw new Error('Freeze base not within $1 of 53087');
+
+      log('✓ Test1 passed');
+
+      // Test 2: No Freeze row → Freeze Base should be hidden (—) and no trace step
+      $('rate').value = '7.000'; setState('rate','7.000',true);
+      $('eq').value = '3.0000'; setState('eq','3.0000',true);
+      $('tax').value = '700.00'; setState('tax','700.00',true);
+      exemptions = [];
+      addExemption('Homeowner','H');
+      // enter bill reduction = $350 → AEAV should be 5000 at 7%
+      const tb2 = $('exRows');
+      const rowH = tb2.querySelector('tr');
+      const inpH = rowH.querySelector('input[data-f="savings"]');
+      inpH.value = '350.00';
+      inpH.dispatchEvent(new Event('input', {bubbles:true}));
+      recompute();
+
+      const fbTxt = $('outFreezeBase').textContent.trim();
+      const traceText = $('trace').textContent;
+      log(`Test2 FreezeBase display='${fbTxt}' (expect '—')`);
+      if(fbTxt !== '—') throw new Error('Freeze base should be hidden when no F exemption');
+      if(/"FreezeBaseAEAV"/.test(traceText)) throw new Error('Trace should not include FreezeBaseAEAV when no F exemption');
+      log('✓ Test2 passed');
+
+      // Test 3: Enter MV only (no Tax, no Rate) → no tax field warning
+      // Reset relevant fields
+      $('rate').value = ''; setState('rate','',true);
+      $('tax').value = ''; setState('tax','',true);
+      $('mv').value = '300000'; setState('mv','300000',true);
+      recompute();
+      const taxMsg = document.getElementById('taxMsg').textContent.trim();
+      const taxHasBad = document.getElementById('tax').classList.contains('bad');
+      log(`Test3 taxMsg='${taxMsg}', tax.bad=${taxHasBad} (expect '', false)`);
+      if(taxMsg !== '' || taxHasBad) throw new Error('Tax field should not warn when only MV is entered');
+
+      // Test 4: Solve Rate from MV + Tax (no exemptions)
+      document.getElementById('rate').value = ''; setState('rate','',true); status.set('rate','blank');
+      document.getElementById('eq').value = '3.0'; setState('eq','3.0',true);
+      document.getElementById('assess').value = '10'; setState('assess','10',true);
+      exemptions = []; renderExemptions();
+      document.getElementById('mv').value = '300000'; setState('mv','300000',true);
+      document.getElementById('tax').value = '6300.00'; setState('tax','6300.00',true); // AEAV=300k*10%*3=90k → rate=7.0%
+      recompute();
+      const rateVal = document.getElementById('rate').value;
+      log(`Test4 solved Rate=${rateVal} (expect 7.000)`);
+      if(rateVal !== '7.000') throw new Error('Rate should auto-solve to 7.000 from MV & Tax with no exemptions');
+
+      // Test 7: Derived flows into inputs; lock behavior
+      document.getElementById('av').value = ''; setState('av','',true); status.set('av','blank');
+      document.getElementById('aav').value = ''; setState('aav','',true); status.set('aav','blank');
+      document.getElementById('aeav').value = ''; setState('aeav','',true); status.set('aeav','blank');
+      recompute();
+      const avVal = document.getElementById('av').value;
+      const aavVal = document.getElementById('aav').value;
+      const aeavVal = document.getElementById('aeav').value;
+      log(`Test7 derived AV=${avVal}, AAV=${aavVal}, AEAV=${aeavVal}`);
+      if(!(avVal && aavVal && aeavVal)) throw new Error('Derived values should populate AV/AAV/AEAV inputs');
+      // Now lock AV by typing a new value and ensure it doesn't get overwritten immediately
+      document.getElementById('av').value = '32000.00'; setState('av','32000.00',true);
+      const avLocked = document.getElementById('av').value;
+      recompute();
+      if(document.getElementById('av').value !== avLocked) throw new Error('Locked AV should not be overwritten by derived recompute');
+
+      // Test 5: Auto-fill Eq from Year (2010 → 2.9706 per table)
+      document.getElementById('taxYear').value = '2010'; setState('taxYear','2010',true);
+      document.getElementById('eq').value = ''; setState('eq','',false); maybeAutoFillEq();
+      const eqVal = document.getElementById('eq').value;
+      log(`Test5 eq-from-year=${eqVal} (expect 2.9706)`);
+      if(eqVal !== '2.9706') throw new Error('Eq should auto-fill to 2.9706 for 2010');
+
+      // Test 6: Assessment Class mapping
+      document.getElementById('classCode').value = '5';
+      document.getElementById('classCode').dispatchEvent(new Event('change', {bubbles:true}));
+      let assessVal = document.getElementById('assess').value;
+      log(`Test6 class 5 → assess=${assessVal} (expect 4)`);
+      if(assessVal !== '4') throw new Error('Class 5 should map to 4%');
+      document.getElementById('classCode').value = '0';
+      document.getElementById('classCode').dispatchEvent(new Event('change', {bubbles:true}));
+      assessVal = document.getElementById('assess').value;
+      if(assessVal !== '0') throw new Error('Class 0 should map to 0%');
+      document.getElementById('classCode').value = 'A';
+      document.getElementById('classCode').dispatchEvent(new Event('change', {bubbles:true}));
+      assessVal = document.getElementById('assess').value;
+      if(assessVal !== '6.6666') throw new Error('Class A should map to 6.6666%');
+      document.getElementById('classCode').value = 'B';
+      document.getElementById('classCode').dispatchEvent(new Event('change', {bubbles:true}));
+      assessVal = document.getElementById('assess').value;
+      if(assessVal !== '5') throw new Error('Class B should map to 5%');
+    } catch(err){
+      log('✗ '+err.message);
+    } finally {
+      restoreUI(snap);
+      out.textContent = logs.join('\n');
+    }
+  }
+
+  function snapshotUI(){
+    return {
+      fields: ['taxYear','assess','eq','rate','mv','av','aav','aeav','tax'].reduce((m,id)=>{ const el=document.getElementById(id); m[id]=el?el.value:''; return m; },{}),
+      exemptions: JSON.parse(JSON.stringify(exemptions)),
+      given: Array.from(given),
+      status: Array.from(status.entries())
+    };
+  }
+  function restoreUI(s){
+    if(!s) return;
+    (s.given||[]).forEach(k=> given.add(k));
+    (s.status||[]).forEach(([k,v])=> status.set(k,v));
+    Object.entries(s.fields||{}).forEach(([id,val])=>{
+      const el = document.getElementById(id); if(!el) return;
+      el.value = val;
+      if(val==='') { state.delete(id); } else { state.set(id, val); }
+    });
+    exemptions = s.exemptions || [];
+    renderExemptions();
+    recompute();
+  }
+
+  // First paint
+  renderExemptions();
+  recompute();
