@@ -678,135 +678,194 @@
   });
 
   // --- Self Tests ------------------------------------------------------------
+  // Test helper functions to reduce duplication
+  function setField(id, value, markAsGiven = true){
+    const el = document.getElementById(id);
+    el.value = value;
+    setState(id, value, markAsGiven);
+  }
+
+  function clearField(id){
+    const el = document.getElementById(id);
+    el.value = '';
+    setState(id, '', true);
+    status.set(id, 'blank');
+  }
+
+  function setExemptionBills(bills){
+    const tb = $('exRows');
+    const rows = Array.from(tb.querySelectorAll('tr'));
+    rows.forEach((tr, i) => {
+      if (i < bills.length) {
+        const inp = tr.querySelector('input[data-f="savings"]');
+        inp.value = bills[i].toFixed(2);
+        inp.dispatchEvent(new Event('input', {bubbles:true}));
+      }
+    });
+  }
+
+  function assert(condition, message, log){
+    if (!condition) throw new Error(message);
+  }
+
+  function near(a, b, eps = 1){
+    return Math.abs(a - b) <= eps;
+  }
+
+  // Individual test cases extracted for clarity
+  function test1_freezeBaseCalculation(log){
+    // 2010 case: Rate 7.188%, Tax $3,097.09, Exemptions (bill): H=431.28, S=287.52, F=3,286.71
+    // Expected: AEAV ≈ 43,087; Freeze Base AEAV ≈ 53,087
+    setField('rate', '7.188');
+    setField('eq', '1.4389');
+    setField('tax', '3097.09');
+
+    exemptions = [];
+    addExemption('Homeowner', 'H');
+    addExemption('Senior', 'S');
+    addExemption('Senior Freeze', 'F');
+    setExemptionBills([431.28, 287.52, 3286.71]);
+    recompute();
+
+    const aeav = Number($('outAEAV').textContent.replace(/[^0-9.]/g, ''));
+    const freezeBase = Number($('outFreezeBase').textContent.replace(/[^0-9.]/g, ''));
+
+    log(`Test1 AEAV=${aeav} (expect ~43087)`);
+    log(`Test1 FreezeBase=${freezeBase} (expect ~53087)`);
+    assert(near(aeav, 43087, 1), 'AEAV not within $1 of 43087', log);
+    assert(near(freezeBase, 53087, 1), 'Freeze base not within $1 of 53087', log);
+    log('✓ Test1 passed');
+  }
+
+  function test2_freezeBaseHidden(log){
+    // No Freeze row → Freeze Base should be hidden (—) and no trace step
+    setField('rate', '7.000');
+    setField('eq', '3.0000');
+    setField('tax', '700.00');
+
+    exemptions = [];
+    addExemption('Homeowner', 'H');
+    setExemptionBills([350.00]); // → AEAV should be 5000 at 7%
+    recompute();
+
+    const freezeBaseDisplay = $('outFreezeBase').textContent.trim();
+    const traceText = $('trace').textContent;
+
+    log(`Test2 FreezeBase display='${freezeBaseDisplay}' (expect '—')`);
+    assert(freezeBaseDisplay === '—', 'Freeze base should be hidden when no F exemption', log);
+    assert(!/"FreezeBaseAEAV"/.test(traceText), 'Trace should not include FreezeBaseAEAV when no F exemption', log);
+    log('✓ Test2 passed');
+  }
+
+  function test3_noTaxWarningWithMvOnly(log){
+    // Enter MV only (no Tax, no Rate) → no tax field warning
+    clearField('rate');
+    clearField('tax');
+    setField('mv', '300000');
+    recompute();
+
+    const taxMsg = $('taxMsg').textContent.trim();
+    const taxHasBad = $('tax').classList.contains('bad');
+
+    log(`Test3 taxMsg='${taxMsg}', tax.bad=${taxHasBad} (expect '', false)`);
+    assert(taxMsg === '' && !taxHasBad, 'Tax field should not warn when only MV is entered', log);
+    log('✓ Test3 passed');
+  }
+
+  function test4_autoSolveRate(log){
+    // Solve Rate from MV + Tax (no exemptions)
+    // AEAV=300k*10%*3=90k → rate=7.0%
+    clearField('rate');
+    setField('eq', '3.0');
+    setField('assess', '10');
+    exemptions = [];
+    renderExemptions();
+    setField('mv', '300000');
+    setField('tax', '6300.00');
+    recompute();
+
+    const rateVal = $('rate').value;
+    log(`Test4 solved Rate=${rateVal} (expect 7.000)`);
+    assert(rateVal === '7.000', 'Rate should auto-solve to 7.000 from MV & Tax with no exemptions', log);
+    log('✓ Test4 passed');
+  }
+
+  function test5_autoFillEqFromYear(log){
+    // Auto-fill Eq from Year (2010 → 2.9706 per table)
+    setField('taxYear', '2010');
+    clearField('eq');
+    status.set('eq', 'blank');
+    maybeAutoFillEq();
+
+    const eqVal = $('eq').value;
+    log(`Test5 eq-from-year=${eqVal} (expect 2.9706)`);
+    assert(eqVal === '2.9706', 'Eq should auto-fill to 2.9706 for 2010', log);
+    log('✓ Test5 passed');
+  }
+
+  function test6_assessmentClassMapping(log){
+    // Assessment Class mapping
+    const testCases = [
+      {classCode: '5', expected: '4'},
+      {classCode: '0', expected: '0'},
+      {classCode: 'A', expected: '6.6666'},
+      {classCode: 'B', expected: '5'}
+    ];
+
+    testCases.forEach(({classCode, expected}) => {
+      $('classCode').value = classCode;
+      $('classCode').dispatchEvent(new Event('change', {bubbles:true}));
+      const assessVal = $('assess').value;
+      log(`Test6 class ${classCode} → assess=${assessVal} (expect ${expected})`);
+      assert(assessVal === expected, `Class ${classCode} should map to ${expected}%`, log);
+    });
+
+    log('✓ Test6 passed');
+  }
+
+  function test7_derivedFlowsAndLockBehavior(log){
+    // Derived flows into inputs; lock behavior
+    clearField('av');
+    clearField('aav');
+    clearField('aeav');
+    recompute();
+
+    const avVal = $('av').value;
+    const aavVal = $('aav').value;
+    const aeavVal = $('aeav').value;
+
+    log(`Test7 derived AV=${avVal}, AAV=${aavVal}, AEAV=${aeavVal}`);
+    assert(avVal && aavVal && aeavVal, 'Derived values should populate AV/AAV/AEAV inputs', log);
+
+    // Lock AV by typing a new value and ensure it doesn't get overwritten
+    setField('av', '32000.00');
+    const avLocked = $('av').value;
+    recompute();
+
+    assert($('av').value === avLocked, 'Locked AV should not be overwritten by derived recompute', log);
+    log('✓ Test7 passed');
+  }
+
   function runSelfTests(){
     const out = $('testOut');
     const snap = snapshotUI();
     const logs = [];
     function log(s){ logs.push(s); }
-    function near(a,b,eps=1){ return Math.abs(a-b) <= eps; }
 
-    try{
-      // Test 1: 2010 case from our discussion
-      // Rate 7.188%, Tax $3,097.09, Exemptions (bill): H=431.28, S=287.52, F=3,286.71
-      // Expected: AEAV ≈ 43,087; Freeze Base AEAV ≈ 53,087
-      $('rate').value = '7.188'; setState('rate','7.188',true);
-      $('eq').value = '1.4389'; setState('eq','1.4389',true);
-      $('tax').value = '3097.09'; setState('tax','3097.09',true);
-      exemptions = [];
-      addExemption('Homeowner','H');
-      addExemption('Senior','S');
-      addExemption('Senior Freeze','F');
-      // set bill reductions
-      const tb = $('exRows');
-      const rows = Array.from(tb.querySelectorAll('tr'));
-      const bills = [431.28, 287.52, 3286.71];
-      rows.forEach((tr,i)=>{
-        const inp = tr.querySelector('input[data-f="savings"]');
-        inp.value = bills[i].toFixed(2);
-        // simulate input
-        inp.dispatchEvent(new Event('input', {bubbles:true}));
-      });
-      recompute();
+    const tests = [
+      test1_freezeBaseCalculation,
+      test2_freezeBaseHidden,
+      test3_noTaxWarningWithMvOnly,
+      test4_autoSolveRate,
+      test5_autoFillEqFromYear,
+      test6_assessmentClassMapping,
+      test7_derivedFlowsAndLockBehavior
+    ];
 
-      const aeavTxt = $('outAEAV').textContent.replace(/[^0-9.]/g,'');
-      const aeav = Number(aeavTxt);
-      const freezeTxt = $('outFreezeBase').textContent.replace(/[^0-9.]/g,'');
-      const freezeBase = Number(freezeTxt);
-
-      log(`Test1 AEAV=${aeav} (expect ~43087)`);
-      log(`Test1 FreezeBase=${freezeBase} (expect ~53087)`);
-      if(!near(aeav,43087,1)) throw new Error('AEAV not within $1 of 43087');
-      if(!near(freezeBase,53087,1)) throw new Error('Freeze base not within $1 of 53087');
-
-      log('✓ Test1 passed');
-
-      // Test 2: No Freeze row → Freeze Base should be hidden (—) and no trace step
-      $('rate').value = '7.000'; setState('rate','7.000',true);
-      $('eq').value = '3.0000'; setState('eq','3.0000',true);
-      $('tax').value = '700.00'; setState('tax','700.00',true);
-      exemptions = [];
-      addExemption('Homeowner','H');
-      // enter bill reduction = $350 → AEAV should be 5000 at 7%
-      const tb2 = $('exRows');
-      const rowH = tb2.querySelector('tr');
-      const inpH = rowH.querySelector('input[data-f="savings"]');
-      inpH.value = '350.00';
-      inpH.dispatchEvent(new Event('input', {bubbles:true}));
-      recompute();
-
-      const fbTxt = $('outFreezeBase').textContent.trim();
-      const traceText = $('trace').textContent;
-      log(`Test2 FreezeBase display='${fbTxt}' (expect '—')`);
-      if(fbTxt !== '—') throw new Error('Freeze base should be hidden when no F exemption');
-      if(/"FreezeBaseAEAV"/.test(traceText)) throw new Error('Trace should not include FreezeBaseAEAV when no F exemption');
-      log('✓ Test2 passed');
-
-      // Test 3: Enter MV only (no Tax, no Rate) → no tax field warning
-      // Reset relevant fields
-      $('rate').value = ''; setState('rate','',true);
-      $('tax').value = ''; setState('tax','',true);
-      $('mv').value = '300000'; setState('mv','300000',true);
-      recompute();
-      const taxMsg = document.getElementById('taxMsg').textContent.trim();
-      const taxHasBad = document.getElementById('tax').classList.contains('bad');
-      log(`Test3 taxMsg='${taxMsg}', tax.bad=${taxHasBad} (expect '', false)`);
-      if(taxMsg !== '' || taxHasBad) throw new Error('Tax field should not warn when only MV is entered');
-
-      // Test 4: Solve Rate from MV + Tax (no exemptions)
-      document.getElementById('rate').value = ''; setState('rate','',true); status.set('rate','blank');
-      document.getElementById('eq').value = '3.0'; setState('eq','3.0',true);
-      document.getElementById('assess').value = '10'; setState('assess','10',true);
-      exemptions = []; renderExemptions();
-      document.getElementById('mv').value = '300000'; setState('mv','300000',true);
-      document.getElementById('tax').value = '6300.00'; setState('tax','6300.00',true); // AEAV=300k*10%*3=90k → rate=7.0%
-      recompute();
-      const rateVal = document.getElementById('rate').value;
-      log(`Test4 solved Rate=${rateVal} (expect 7.000)`);
-      if(rateVal !== '7.000') throw new Error('Rate should auto-solve to 7.000 from MV & Tax with no exemptions');
-
-      // Test 7: Derived flows into inputs; lock behavior
-      document.getElementById('av').value = ''; setState('av','',true); status.set('av','blank');
-      document.getElementById('aav').value = ''; setState('aav','',true); status.set('aav','blank');
-      document.getElementById('aeav').value = ''; setState('aeav','',true); status.set('aeav','blank');
-      recompute();
-      const avVal = document.getElementById('av').value;
-      const aavVal = document.getElementById('aav').value;
-      const aeavVal = document.getElementById('aeav').value;
-      log(`Test7 derived AV=${avVal}, AAV=${aavVal}, AEAV=${aeavVal}`);
-      if(!(avVal && aavVal && aeavVal)) throw new Error('Derived values should populate AV/AAV/AEAV inputs');
-      // Now lock AV by typing a new value and ensure it doesn't get overwritten immediately
-      document.getElementById('av').value = '32000.00'; setState('av','32000.00',true);
-      const avLocked = document.getElementById('av').value;
-      recompute();
-      if(document.getElementById('av').value !== avLocked) throw new Error('Locked AV should not be overwritten by derived recompute');
-
-      // Test 5: Auto-fill Eq from Year (2010 → 2.9706 per table)
-      document.getElementById('taxYear').value = '2010'; setState('taxYear','2010',true);
-      document.getElementById('eq').value = ''; setState('eq','',false); maybeAutoFillEq();
-      const eqVal = document.getElementById('eq').value;
-      log(`Test5 eq-from-year=${eqVal} (expect 2.9706)`);
-      if(eqVal !== '2.9706') throw new Error('Eq should auto-fill to 2.9706 for 2010');
-
-      // Test 6: Assessment Class mapping
-      document.getElementById('classCode').value = '5';
-      document.getElementById('classCode').dispatchEvent(new Event('change', {bubbles:true}));
-      let assessVal = document.getElementById('assess').value;
-      log(`Test6 class 5 → assess=${assessVal} (expect 4)`);
-      if(assessVal !== '4') throw new Error('Class 5 should map to 4%');
-      document.getElementById('classCode').value = '0';
-      document.getElementById('classCode').dispatchEvent(new Event('change', {bubbles:true}));
-      assessVal = document.getElementById('assess').value;
-      if(assessVal !== '0') throw new Error('Class 0 should map to 0%');
-      document.getElementById('classCode').value = 'A';
-      document.getElementById('classCode').dispatchEvent(new Event('change', {bubbles:true}));
-      assessVal = document.getElementById('assess').value;
-      if(assessVal !== '6.6666') throw new Error('Class A should map to 6.6666%');
-      document.getElementById('classCode').value = 'B';
-      document.getElementById('classCode').dispatchEvent(new Event('change', {bubbles:true}));
-      assessVal = document.getElementById('assess').value;
-      if(assessVal !== '5') throw new Error('Class B should map to 5%');
-    } catch(err){
-      log('✗ '+err.message);
+    try {
+      tests.forEach(test => test(log));
+    } catch(err) {
+      log('✗ ' + err.message);
     } finally {
       restoreUI(snap);
       out.textContent = logs.join('\n');
